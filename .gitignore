@@ -1,0 +1,33 @@
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+pnpm-debug.log
+
+# Build output
+dist/
+out/
+.vscode-test/
+*.vsix
+
+# VS Code internal junk
+.vscode/
+.history/
+
+# TypeScript
+*.tsbuildinfo
+
+# Logs
+*.log
+*.trace
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Optional: ignore tests if not used
+coverage/
+test-results/
+
+# Ignore your own MCP folder (your extension writes here)
+.mcp/
