@@ -15,10 +15,10 @@ interface SerializableDiagnostic {
 let diagnosticsFileUri: vscode.Uri | undefined;
 let debounceTimer: NodeJS.Timeout | undefined;
 
-// Track which files were opened **by the extension**
+// Track files opened by the extension (so we know which tabs to close)
 const extensionOpenedFiles = new Set<string>();
 
-// Collection used to clear diagnostics for deleted files
+// Used to clear stale diagnostics for deleted files
 const cleanupCollection = vscode.languages.createDiagnosticCollection("diagnostics-exporter-cleanup");
 
 export function activate(context: vscode.ExtensionContext) {
@@ -26,77 +26,73 @@ export function activate(context: vscode.ExtensionContext) {
 
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
     if (!workspaceFolder) {
-        console.warn("[diagnostics-exporter] No workspace open; extension idle.");
+        console.warn("[diagnostics-exporter] No workspace open. Idle.");
         return;
     }
 
     const mcpFolderUri = vscode.Uri.joinPath(workspaceFolder.uri, ".mcp");
     diagnosticsFileUri = vscode.Uri.joinPath(mcpFolderUri, "diagnostics.json");
 
-    // Ensure .mcp folder exists
     vscode.workspace.fs.createDirectory(mcpFolderUri).then(
         () => scheduleDiagnosticsWrite(),
-        (err) => console.error("[diagnostics-exporter] Failed to create .mcp directory:", err)
+        err => console.error("[diagnostics-exporter] Failed to create .mcp folder:", err)
     );
 
-    // Rewrite diagnostics.json when diagnostics change
     context.subscriptions.push(
         vscode.languages.onDidChangeDiagnostics(() => scheduleDiagnosticsWrite()),
         vscode.workspace.onDidSaveTextDocument(() => scheduleDiagnosticsWrite())
     );
 
-    // FILE SYSTEM WATCHER — catches new/changed files (including agent-generated)
+    // Watcher: detect new/changed/deleted files
     const watcher = vscode.workspace.createFileSystemWatcher(
         "**/*.{cs,ts,js,tsx,jsx,py,gd,gdshader,tscn,tres,res,cfg,ini,json,xml,yaml}"
     );
 
-    watcher.onDidCreate(async (uri) => {
-        if (shouldIgnore(uri)) return;
-        console.log("[diagnostics-exporter] File created:", uri.fsPath);
-        await safelyTriggerScan(uri);
-    });
+    watcher.onDidCreate(uri => onFileCreatedOrChanged(uri));
+    watcher.onDidChange(uri => onFileCreatedOrChanged(uri));
 
-    watcher.onDidChange(async (uri) => {
-        if (shouldIgnore(uri)) return;
-        console.log("[diagnostics-exporter] File changed:", uri.fsPath);
-        await safelyTriggerScan(uri);
-    });
-
-    watcher.onDidDelete((uri) => {
+    watcher.onDidDelete(uri => {
         if (shouldIgnore(uri)) return;
         console.log("[diagnostics-exporter] File deleted:", uri.fsPath);
-        cleanupCollection.set(uri, []); 
+
+        cleanupCollection.set(uri, []); // clear diagnostics for removed file
         scheduleDiagnosticsWrite();
     });
 
     context.subscriptions.push(watcher);
 
-    // Initial full workspace preload
+    // Initial preload
     preloadDiagnostics().catch(err =>
         console.error("[diagnostics-exporter] preloadDiagnostics ERROR:", err)
     );
-
-    console.log("[diagnostics-exporter] preloadDiagnostics() CALLED");
 }
 
 export function deactivate() {
-    if (debounceTimer) clearTimeout(debounceTimer);
+    if (debounceTimer) {
+        clearTimeout(debounceTimer);
+    }
 }
 
+//
+// IGNORE RULES
+//
 function shouldIgnore(uri: vscode.Uri): boolean {
-    const path = uri.fsPath.toLowerCase();
+    const p = uri.fsPath.toLowerCase();
     return (
-        path.includes("\\.mcp\\") ||
-        path.includes("/.mcp/") ||
-        path.includes("\\.claude\\") ||
-        path.includes("/.claude/") ||
-        path.includes("\\.godot\\") ||
-        path.includes("/.godot/") ||
-        path.includes("\\dist\\") ||
-        path.includes("/dist/")
+        p.includes("\\.mcp\\") ||
+        p.includes("/.mcp/") ||
+        p.includes("\\.claude\\") ||
+        p.includes("/.claude/") ||
+        p.includes("\\.godot\\") ||
+        p.includes("/.godot/") ||
+        p.includes("\\dist\\") ||
+        p.includes("/dist/")
     );
 }
 
+//
+// DEBOUNCE WRITE
+//
 function scheduleDiagnosticsWrite() {
     if (!diagnosticsFileUri) return;
 
@@ -104,36 +100,47 @@ function scheduleDiagnosticsWrite() {
 
     debounceTimer = setTimeout(() => {
         writeDiagnosticsFile(diagnosticsFileUri!);
-    }, 300);
+    }, 200);
 }
 
-// ==========================
-// FULL WORKSPACE PRELOAD
-// ==========================
+//
+// PRELOAD ALL WORKSPACE FILES
+//
 async function preloadDiagnostics() {
     const files = await vscode.workspace.findFiles(
         "**/*.{cs,ts,js,tsx,jsx,py,gd,gdshader,tscn}",
-        "**/{node_modules,Library,.git,.godot/imported,.mcp,.claude,.godot,.vscode,dist,.opencode}/**"
+        "**/{node_modules,Library,.git,.godot/imported,.mcp,.claude,.godot,.vscode,dist}/**"
     );
 
     console.log(`[diagnostics-exporter] Preloading ${files.length} files...`);
 
     for (const file of files) {
-        if (shouldIgnore(file)) continue;
-        await safelyTriggerScan(file);
+        if (!shouldIgnore(file)) {
+            await safelyScanFile(file);
+        }
     }
 
     console.log("[diagnostics-exporter] Preload complete");
 }
 
-// ==========================
-// SAFE SCANNING WRAPPER
-// ==========================
-async function safelyTriggerScan(uri: vscode.Uri) {
+//
+// FILE WATCHER CALLBACK
+//
+async function onFileCreatedOrChanged(uri: vscode.Uri) {
+    if (shouldIgnore(uri)) return;
+
+    console.log("[diagnostics-exporter] File updated:", uri.fsPath);
+    await safelyScanFile(uri);
+}
+
+//
+// SAFELY OPEN → TRIGGER LSP → CLOSE ONLY OUR TAB
+//
+async function safelyScanFile(uri: vscode.Uri) {
     try {
         const doc = await vscode.workspace.openTextDocument(uri);
 
-        // Mark this file so we know it’s safe to close afterward
+        // mark file as opened by extension
         extensionOpenedFiles.add(uri.fsPath);
 
         const editor = await vscode.window.showTextDocument(doc, {
@@ -141,34 +148,47 @@ async function safelyTriggerScan(uri: vscode.Uri) {
             preserveFocus: true
         });
 
-        await new Promise(res => setTimeout(res, 150));
+        // let LSP catch up
+        await new Promise(res => setTimeout(res, 120));
 
-        // Only close editors WE opened (avoids closing user tabs or terminals)
-        if (editor?.document && extensionOpenedFiles.has(editor.document.uri.fsPath)) {
-            if (editor.viewColumn !== undefined) {
-                await vscode.commands.executeCommand(
-                    "workbench.action.closeEditorsInGroup",
-                    { groupId: editor.viewColumn }
-                );
-            }
+        await closeTabForDocument(doc);
 
-            extensionOpenedFiles.delete(editor.document.uri.fsPath);
-        }
-
-        console.log(`[diagnostics-exporter] Scanned: ${uri.fsPath}`);
-
+        console.log("[diagnostics-exporter] Scanned:", uri.fsPath);
     } catch (err) {
         console.error("[diagnostics-exporter] Failed to scan:", uri.fsPath, err);
     }
 }
 
-// ==========================
+//
+// CLOSE *ONLY THE TAB* WE OPENED — NOT TERMINALS, NOT SIDEBARS
+//
+async function closeTabForDocument(doc: vscode.TextDocument) {
+    const path = doc.uri.fsPath;
+
+    if (!extensionOpenedFiles.has(path)) {
+        return; // user opened file → do not close
+    }
+
+    const allTabs = vscode.window.tabGroups.all.flatMap(g => g.tabs);
+
+    const targetTab = allTabs.find(tab =>
+        tab.input instanceof vscode.TabInputText &&
+        tab.input.uri.fsPath === path
+    );
+
+    if (targetTab) {
+        await vscode.window.tabGroups.close(targetTab);
+    }
+
+    extensionOpenedFiles.delete(path);
+}
+
+//
 // WRITE diagnostics.json
-// ==========================
+//
 async function writeDiagnosticsFile(fileUri: vscode.Uri) {
     try {
         const allDiagnostics = vscode.languages.getDiagnostics();
-
         const serializable: SerializableDiagnostic[] = [];
 
         for (const [uri, diags] of allDiagnostics) {
@@ -205,9 +225,8 @@ async function writeDiagnosticsFile(fileUri: vscode.Uri) {
         );
 
         await vscode.workspace.fs.writeFile(fileUri, Buffer.from(contents, "utf8"));
-
         console.log(
-            `[diagnostics-exporter] Wrote diagnostics.json (${serializable.length} diagnostics)`
+            `[diagnostics-exporter] Updated diagnostics.json (${serializable.length} diagnostics)`
         );
 
     } catch (err) {
@@ -215,6 +234,9 @@ async function writeDiagnosticsFile(fileUri: vscode.Uri) {
     }
 }
 
+//
+// SEVERITY MAPPING
+//
 function severityToString(sev: vscode.DiagnosticSeverity): SerializableDiagnostic["severity"] {
     switch (sev) {
         case vscode.DiagnosticSeverity.Error: return "error";
