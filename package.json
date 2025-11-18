@@ -2,7 +2,7 @@
   "name": "diagnostics-exporter",
   "displayName": "Diagnostics Exporter",
   "description": "Exports VS Code diagnostics (Problems) to a JSON file for external tools/agents.",
-  "version": "0.0.1",
+  "version": "0.0.5",
   "publisher": "RaynoldVanHeyningen",
   "repository": {
     "type": "git",
